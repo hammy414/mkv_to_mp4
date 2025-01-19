@@ -31,17 +31,18 @@ class FFmpegProgress:
 
 class MKVHandler(FileSystemEventHandler):
     def __init__(self, root_dir, target_resolution=None, encoding_preset='medium', 
-                 crf=23, profile='high', tune=None, maxrate=None, bufsize=None):
+                crf=23, profile='high', tune=None, maxrate=None, bufsize=None, force_encode=False):
         self.root_dir = Path(root_dir)
         self.target_resolution = target_resolution
         self.encoding_preset = encoding_preset
         self.crf = crf
         self.profile = profile
         self.tune = tune
-        self.maxrate = maxrate
-        self.bufsize = bufsize or (maxrate * 2 if maxrate else None)  # Default buffer size is 2x maxrate
-        self.setup_logging()
-        self.scan_existing_files()
+        self.force_encode = force_encode
+        self.maxrate = maxrate if force_encode else None
+        self.bufsize = bufsize or (maxrate * 2 if maxrate else None)
+        self.setup_logging()        # Add this line
+        self.scan_existing_files()  # Add this line
 
     def setup_logging(self):
         """Configure logging settings for the MKV handler"""
@@ -158,7 +159,7 @@ class MKVHandler(FileSystemEventHandler):
                     needs_downscale = True
 
             # Calculate recommended bitrate if not specified
-            if not self.maxrate:
+            if self.force_encode:
                 if needs_downscale:
                     self.maxrate = self.get_recommended_bitrate(target_width, target_height)
                 else:
@@ -171,15 +172,17 @@ class MKVHandler(FileSystemEventHandler):
                 print(f"Target Resolution: {target_width}x{target_height}")
             print(f"Size: {video_info['size']} MB")
             print(f"Duration: {time.strftime('%H:%M:%S', time.gmtime(video_info['duration']))}")
-            print(f"Encoding Settings:")
-            print(f"- Preset: {self.encoding_preset}")
-            print(f"- CRF: {self.crf}")
-            print(f"- Profile: {self.profile}")
-            print(f"- Max Bitrate: {self.maxrate}")
-            print(f"- Buffer Size: {self.bufsize}")
-            if self.tune:
-                print(f"- Tune: {self.tune}")
-            
+            if needs_downscale or self.force_encode:
+                print(f"Encoding Settings:")
+                print(f"- Preset: {self.encoding_preset}")
+                print(f"- CRF: {self.crf}")
+                print(f"- Profile: {self.profile}")
+                print(f"- Max Bitrate: {self.maxrate}")
+                print(f"- Buffer Size: {self.bufsize}")
+                if self.tune:
+                    print(f"- Tune: {self.tune}")
+            else:
+                print("Mode: Stream copy (fast)")
             cmd = [
                 'ffmpeg',
                 '-i', str(input_path),
@@ -189,7 +192,7 @@ class MKVHandler(FileSystemEventHandler):
             ]
             
             # Video encoding settings
-            if needs_downscale or self.maxrate:
+            if needs_downscale or self.force_encode:
                 cmd.extend([
                     '-c:v', 'libx264',
                     '-preset', self.encoding_preset,
@@ -220,17 +223,44 @@ class MKVHandler(FileSystemEventHandler):
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                universal_newlines=True
+                universal_newlines=True,
+                bufsize=1  # Line buffered
             )
             
-            while True:
+            while process.poll() is None:
                 line = process.stdout.readline()
-                if not line and process.poll() is not None:
-                    break
-                time_match = re.search(r'out_time_ms=(\d+)', line)
-                if time_match:
-                    current_time = int(time_match.group(1)) / 1000000
-                    progress.update(current_time)
+                
+                if not line:
+                    continue
+                    
+                # Check for progress in milliseconds format
+                if 'out_time_ms=' in line:
+                    try:
+                        time_match = re.search(r'out_time_ms=(\d+)', line)
+                        if time_match:
+                            current_time = int(time_match.group(1)) / 1000000.0
+                            progress.update(current_time)
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Progress parsing error: {str(e)}")
+                        continue
+                
+                # Also check for progress in HH:MM:SS format
+                elif 'time=' in line:
+                    try:
+                        time_match = re.search(r'time=(\d{2}:\d{2}:\d{2})', line)
+                        if time_match:
+                            time_str = time_match.group(1)
+                            h, m, s = map(int, time_str.split(':'))
+                            current_time = h * 3600 + m * 60 + s
+                            progress.update(current_time)
+                    except (ValueError, TypeError) as e:
+                        logging.warning(f"Time parsing error: {str(e)}")
+                        continue
+            
+            # Get any error output
+            error_output = process.stderr.read()
+            if error_output:
+                logging.debug(f"FFmpeg output: {error_output}")
             
             progress.close()
             
@@ -243,7 +273,7 @@ class MKVHandler(FileSystemEventHandler):
                 original_size = video_info['size']
                 size_reduction = round(((original_size - final_size) / original_size) * 100, 1)
                 
-                print(f"✓ Completed: {output_path.relative_to(self.root_dir)}")
+                print(f"\n✓ Completed: {output_path.relative_to(self.root_dir)}")
                 print(f"Original Size: {original_size} MB")
                 print(f"Final Size: {final_size} MB")
                 print(f"Size Reduction: {size_reduction}%")
@@ -254,6 +284,8 @@ class MKVHandler(FileSystemEventHandler):
                 logging.error(f"Error converting {input_path.name}")
                 if temp_output_path.exists():
                     temp_output_path.unlink()
+                if error_output:
+                    logging.error(f"FFmpeg error: {error_output}")
                 
         except Exception as e:
             logging.error(f"Error processing {mkv_path}: {str(e)}")
@@ -295,7 +327,8 @@ def main():
                       help='Maximum bitrate (e.g., 4M for 4Mbps)')
     parser.add_argument('--bufsize',
                       help='Buffer size (defaults to 2x maxrate)')
-    
+    parser.add_argument('--encode', action='store_true',
+                   help='Force video encoding instead of stream copy')
     args = parser.parse_args()
     
     watch_path = Path(args.path).resolve()
@@ -316,7 +349,8 @@ def main():
         args.profile,
         args.tune,
         args.maxrate,
-        args.bufsize
+        args.bufsize,
+        args.encode
     )
     
     observer = Observer()
